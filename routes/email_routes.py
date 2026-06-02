@@ -237,7 +237,13 @@ def _uid_from_fetch_meta(meta_b: bytes) -> str:
 
 
 def _smtp_ready(cfg: dict) -> bool:
-    return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("smtp_password"))
+    if not cfg.get("smtp_host"):
+        return False
+    if (cfg.get("auth_type") or "password") == "oauth2":
+        # OAuth accounts authenticate via XOAUTH2 — a refresh token stands in
+        # for the SMTP password.
+        return bool(cfg.get("oauth_refresh_token") and (cfg.get("smtp_user") or cfg.get("from_address")))
+    return bool(cfg.get("smtp_user") and cfg.get("smtp_password"))
 
 
 def _resolve_send_config(account_id: str | None = None, owner: str = "") -> dict:
@@ -2912,6 +2918,9 @@ def setup_email_routes():
                     "from_address": r.from_address or "",
                     "has_imap_password": bool(r.imap_password),
                     "has_smtp_password": bool(r.smtp_password),
+                    "auth_type": getattr(r, "auth_type", None) or "password",
+                    "oauth_provider": getattr(r, "oauth_provider", None) or "",
+                    "has_oauth": bool(getattr(r, "oauth_refresh_token", None)),
                 })
             return {"accounts": out}
         finally:
@@ -2943,6 +2952,9 @@ def setup_email_routes():
                 smtp_security=_smtp_security_mode({"smtp_security": data.get("smtp_security"), "smtp_port": data.get("smtp_port") or 465}),
                 smtp_user=(data.get("smtp_user") or "").strip(),
                 smtp_password=_enc(data.get("smtp_password") or ""),
+                auth_type=(data.get("auth_type") or "password").strip(),
+                oauth_provider=(data.get("oauth_provider") or "").strip(),
+                oauth_refresh_token=_enc(data.get("oauth_refresh_token") or ""),
                 from_address=(data.get("from_address") or "").strip(),
                 # SECURITY: stamp the creator so all subsequent reads / mutations
                 # can filter by user. Without this every new account leaks to
@@ -2978,7 +2990,8 @@ def setup_email_routes():
             if not row:
                 return {"ok": False, "error": "Account not found"}
             # Simple fields
-            for key in ("name", "imap_host", "imap_user", "smtp_host", "smtp_user", "from_address"):
+            for key in ("name", "imap_host", "imap_user", "smtp_host", "smtp_user",
+                        "from_address", "auth_type", "oauth_provider"):
                 if key in data:
                     setattr(row, key, (data[key] or "").strip())
             for key in ("imap_port", "smtp_port"):
@@ -2996,6 +3009,12 @@ def setup_email_routes():
                 row.imap_password = _enc(data["imap_password"])
             if data.get("smtp_password"):
                 row.smtp_password = _enc(data["smtp_password"])
+            # Refresh token only overwrites when a fresh one is supplied (after
+            # an OAuth sign-in), mirroring the password behaviour.
+            if data.get("oauth_refresh_token"):
+                row.oauth_refresh_token = _enc(data["oauth_refresh_token"])
+                from src.oauth_email import invalidate as _inv
+                _inv(row.id)  # drop any stale cached access token
             db.commit()
             return {"ok": True, "id": row.id}
         finally:
@@ -3073,6 +3092,10 @@ def setup_email_routes():
                     "smtp_security": _smtp_security_mode({"smtp_security": getattr(row, "smtp_security", ""), "smtp_port": row.smtp_port}),
                     "smtp_user": row.smtp_user or "",
                     "smtp_password": _decrypt(row.smtp_password or ""),
+                    "auth_type": getattr(row, "auth_type", None) or "password",
+                    "oauth_provider": getattr(row, "oauth_provider", None) or "",
+                    "oauth_refresh_token": _decrypt(getattr(row, "oauth_refresh_token", None) or ""),
+                    "account_id": row.id,
                 }
                 for key, value in body.items():
                     if key == "account_id":
@@ -3086,22 +3109,43 @@ def setup_email_routes():
         imap_result = {"ok": False}
         smtp_result = None
 
+        auth_type = (body.get("auth_type") or "password").strip()
+        is_oauth = auth_type == "oauth2"
+
+        # OAuth: mint one access token up front, shared by the IMAP + SMTP
+        # checks. The refresh token comes from the saved row or, for a
+        # brand-new account, from the just-completed device-flow sign-in.
+        oauth_token = None
+        oauth_error = None
+        if is_oauth:
+            try:
+                from src.oauth_email import get_access_token, resolve_client_id
+                client_id = resolve_client_id(body.get("oauth_client_id", ""))
+                if not client_id:
+                    oauth_error = "No Microsoft OAuth client ID configured (set MS_OAUTH_CLIENT_ID)"
+                elif not body.get("oauth_refresh_token"):
+                    oauth_error = "Not signed in yet — complete the Microsoft sign-in first"
+                else:
+                    oauth_token = get_access_token(
+                        body.get("account_id") or "test", client_id,
+                        body.get("oauth_refresh_token") or "",
+                    )
+            except Exception as e:
+                oauth_error = str(e)[:200]
+
         imap_host = (body.get("imap_host") or "").strip()
         imap_port = int(body.get("imap_port") or 993)
         imap_user = (body.get("imap_user") or "").strip()
         imap_pass = body.get("imap_password") or ""
         imap_starttls = bool(body.get("imap_starttls"))
 
-        if not (imap_host and imap_user and imap_pass):
+        if is_oauth and oauth_error:
+            imap_result = {"ok": False, "error": oauth_error}
+        elif is_oauth and not (imap_host and imap_user):
+            imap_result = {"ok": False, "error": "Need IMAP host and username"}
+        elif not is_oauth and not (imap_host and imap_user and imap_pass):
             imap_result = {"ok": False, "error": "Need IMAP host, username, and password"}
         else:
-            # Connection mode resolution:
-            #   STARTTLS on  → plain IMAP4 + .starttls() (upgrade)
-            #   STARTTLS off + port 993 → IMAP4_SSL (implicit SSL, "IMAPS")
-            #   STARTTLS off + any other port → plain IMAP4 (no encryption)
-            # Without the last branch, local servers exposed on a non-993
-            # port (Dovecot on 31143, etc.) would always fail the SSL
-            # handshake because they're not actually wrapped in TLS.
             try:
                 conn = _open_imap_connection(
                     imap_host,
@@ -3110,7 +3154,11 @@ def setup_email_routes():
                     timeout=_IMAP_TIMEOUT_SECONDS,
                 )
                 try:
-                    conn.login(imap_user, imap_pass)
+                    if is_oauth:
+                        from src.oauth_email import xoauth2_string
+                        conn.authenticate("XOAUTH2", lambda _: xoauth2_string(imap_user, oauth_token).encode())
+                    else:
+                        conn.login(imap_user, imap_pass)
                     imap_result = {"ok": True}
                 finally:
                     try: conn.logout()
@@ -3132,7 +3180,14 @@ def setup_email_routes():
                     if smtp_security == "starttls":
                         smtp.starttls()
                 try:
-                    smtp.login(smtp_user, smtp_pass)
+                    if is_oauth:
+                        if oauth_error:
+                            raise RuntimeError(oauth_error)
+                        from src.oauth_email import xoauth2_string
+                        smtp.ehlo()
+                        smtp.auth("XOAUTH2", lambda _=None: xoauth2_string(smtp_user, oauth_token))
+                    else:
+                        smtp.login(smtp_user, smtp_pass)
                     smtp_result = {"ok": True}
                 finally:
                     try: smtp.quit()
@@ -3145,6 +3200,45 @@ def setup_email_routes():
             "imap": imap_result,
             "smtp": smtp_result,
         }
+
+    # ═══════════════ Microsoft OAuth2 (device code flow) ═══════════════
+    # Personal Microsoft + Exchange Online accounts can't use Basic Auth. The
+    # device-code flow needs no redirect URI, so it works headless / in Docker
+    # / behind Tailscale. See src/oauth_email.py and issue #725.
+
+    @router.post("/oauth/microsoft/start")
+    async def ms_oauth_start(owner: str = Depends(require_owner)):
+        """Begin Microsoft device-code sign-in. Returns the user_code +
+        verification_uri to display, plus an opaque device_code to poll."""
+        from src.oauth_email import start_device_flow, resolve_client_id
+        client_id = resolve_client_id()
+        if not client_id:
+            return {"ok": False, "error": "No Microsoft OAuth client ID configured. Set MS_OAUTH_CLIENT_ID or the ms_oauth_client_id setting."}
+        try:
+            flow = start_device_flow(client_id)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+        return {
+            "ok": True,
+            "user_code": flow.get("user_code", ""),
+            "verification_uri": flow.get("verification_uri", ""),
+            "device_code": flow.get("device_code", ""),
+            "interval": flow.get("interval", 5),
+            "expires_in": flow.get("expires_in", 900),
+            "message": flow.get("message", ""),
+        }
+
+    @router.post("/oauth/microsoft/poll")
+    async def ms_oauth_poll(data: dict, owner: str = Depends(require_owner)):
+        """Poll for device-flow completion. On success returns the refresh
+        token; the client includes it in the account create/update payload,
+        where it's encrypted at rest (it never leaves this app's origin)."""
+        from src.oauth_email import poll_device_flow, resolve_client_id
+        client_id = resolve_client_id()
+        res = poll_device_flow(client_id, data.get("device_code") or "")
+        if res["status"] == "ok":
+            return {"ok": True, "status": "ok", "refresh_token": res.get("refresh_token", "")}
+        return {"ok": res["status"] == "pending", "status": res["status"], "error": res.get("error", "")}
 
     @router.post("/accounts/{account_id}/set-default")
     async def set_default_account(account_id: str, owner: str = Depends(require_user)):

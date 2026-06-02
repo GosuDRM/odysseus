@@ -72,10 +72,14 @@ def _list_accounts_raw() -> list:
         conn.row_factory = sqlite3.Row
         columns = {r[1] for r in conn.execute("PRAGMA table_info(email_accounts)").fetchall()}
         smtp_security_select = "smtp_security" if "smtp_security" in columns else "'' AS smtp_security"
+        auth_type_select = "auth_type" if "auth_type" in columns else "'password' AS auth_type"
+        oauth_provider_select = "oauth_provider" if "oauth_provider" in columns else "'' AS oauth_provider"
+        oauth_rt_select = "oauth_refresh_token" if "oauth_refresh_token" in columns else "'' AS oauth_refresh_token"
         rows = conn.execute(f"""
             SELECT id, name, is_default, enabled,
                    imap_host, imap_port, imap_user, imap_password, imap_starttls,
-                   smtp_host, smtp_port, {smtp_security_select}, smtp_user, smtp_password, from_address
+                   smtp_host, smtp_port, {smtp_security_select}, smtp_user, smtp_password, from_address,
+                   {auth_type_select}, {oauth_provider_select}, {oauth_rt_select}
             FROM email_accounts WHERE enabled = 1
             ORDER BY is_default DESC, created_at ASC
         """).fetchall()
@@ -152,6 +156,12 @@ def _load_config(account: str | None = None) -> dict:
         "smtp_password": os.environ.get("SMTP_PASSWORD", ""),
         "smtp_starttls": os.environ.get("SMTP_STARTTLS", "false").lower() == "true",
         "smtp_ssl": os.environ.get("SMTP_SSL", "true").lower() == "true",
+        # Auth: "password" (Basic Auth) or "oauth2" (XOAUTH2). The env/settings
+        # fallback path is always Basic Auth; OAuth is account-scoped (DB only).
+        "auth_type": "password",
+        "oauth_provider": "",
+        "oauth_refresh_token": "",
+        "oauth_client_id": "",
         "from_address": os.environ.get("EMAIL_FROM", ""),
         "archive_folder": os.environ.get("ARCHIVE_FOLDER", "Archive"),
         "trash_folder": os.environ.get("TRASH_FOLDER", "Trash"),
@@ -195,6 +205,11 @@ def _load_config(account: str | None = None) -> dict:
         cfg["smtp_security"] = row["smtp_security"] or cfg["smtp_security"] or ("starttls" if int(cfg["smtp_port"]) == 587 else "ssl")
         cfg["smtp_user"] = row["smtp_user"] or cfg["smtp_user"]
         cfg["smtp_password"] = _decrypt(row["smtp_password"]) if row["smtp_password"] else cfg["smtp_password"]
+        # OAuth2 (XOAUTH2) fields — see src/oauth_email.py. Refresh token is
+        # Fernet-encrypted at rest, same as the passwords.
+        cfg["auth_type"] = row.get("auth_type") or "password"
+        cfg["oauth_provider"] = row.get("oauth_provider") or ""
+        cfg["oauth_refresh_token"] = _decrypt(row["oauth_refresh_token"]) if row.get("oauth_refresh_token") else ""
         cfg["from_address"] = row["from_address"] or row["imap_user"] or cfg["from_address"]
     else:
         # Legacy fallback: settings.json flat keys
@@ -217,6 +232,59 @@ def _load_config(account: str | None = None) -> dict:
 
     _ACCOUNT_CACHE[cache_key] = cfg
     return cfg
+
+
+# ── Authentication (Basic Auth + OAuth2 / XOAUTH2) ──
+
+
+def _persist_refresh_token(account_id, new_rt):
+    """Write a rotated OAuth refresh token back to the row (encrypted) and
+    drop the cfg cache so the next read picks up the new token."""
+    if not (account_id and new_rt):
+        return
+    try:
+        from src.secret_storage import encrypt as _enc
+        conn = sqlite3.connect(str(_db_path()))
+        conn.execute(
+            "UPDATE email_accounts SET oauth_refresh_token = ? WHERE id = ?",
+            (_enc(new_rt), account_id),
+        )
+        conn.commit()
+        conn.close()
+        _ACCOUNT_CACHE.clear()
+    except Exception:
+        pass
+
+
+def _oauth_access_token(cfg):
+    from src.oauth_email import get_access_token, resolve_client_id
+    client_id = resolve_client_id(cfg.get("oauth_client_id", ""))
+    acct_id = cfg.get("account_id") or ""
+    return get_access_token(
+        acct_id, client_id, cfg.get("oauth_refresh_token") or "",
+        on_refresh=lambda rt: _persist_refresh_token(acct_id, rt),
+    )
+
+
+def _imap_auth(conn, cfg):
+    if (cfg.get("auth_type") or "password") == "oauth2":
+        from src.oauth_email import xoauth2_string
+        token = _oauth_access_token(cfg)
+        user = cfg.get("imap_user") or cfg.get("from_address") or ""
+        conn.authenticate("XOAUTH2", lambda _: xoauth2_string(user, token).encode())
+    else:
+        conn.login(cfg["imap_user"], cfg["imap_password"])
+
+
+def _smtp_auth(smtp, cfg):
+    if (cfg.get("auth_type") or "password") == "oauth2":
+        from src.oauth_email import xoauth2_string
+        token = _oauth_access_token(cfg)
+        user = cfg.get("smtp_user") or cfg.get("imap_user") or cfg.get("from_address") or ""
+        smtp.ehlo()
+        smtp.auth("XOAUTH2", lambda _=None: xoauth2_string(user, token))
+    elif cfg.get("smtp_user") and cfg.get("smtp_password"):
+        smtp.login(cfg["smtp_user"], cfg["smtp_password"])
 
 
 # ── IMAP helpers ──
@@ -242,7 +310,7 @@ def _imap_connect(account: str | None = None):
             conn.starttls()
     if getattr(conn, "sock", None):
         conn.sock.settimeout(EMAIL_SOCKET_TIMEOUT)
-    conn.login(cfg["imap_user"], cfg["imap_password"])
+    _imap_auth(conn, cfg)
     return conn
 
 
@@ -720,7 +788,12 @@ def _read_email_across_accounts(uid=None, message_id=None, folder="INBOX"):
 
 
 def _smtp_ready(cfg: dict) -> bool:
-    return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("smtp_password"))
+    if not cfg.get("smtp_host"):
+        return False
+    if (cfg.get("auth_type") or "password") == "oauth2":
+        # OAuth accounts send via XOAUTH2 — a refresh token replaces the password.
+        return bool(cfg.get("oauth_refresh_token") and (cfg.get("smtp_user") or cfg.get("from_address")))
+    return bool(cfg.get("smtp_user") and cfg.get("smtp_password"))
 
 
 def _resolve_send_config(account=None):
@@ -765,8 +838,7 @@ def _smtp_connect(account=None, cfg=None):
             port,
             timeout=EMAIL_SOCKET_TIMEOUT,
         )
-    if cfg["smtp_user"] and cfg["smtp_password"]:
-        conn.login(cfg["smtp_user"], cfg["smtp_password"])
+    _smtp_auth(conn, cfg)
     return conn
 
 

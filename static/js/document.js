@@ -87,7 +87,11 @@ import * as Modals from './modalManager.js';
   }
 
   function _accountCanSend(account) {
-    return !!(account && account.smtp_host && account.smtp_user && account.has_smtp_password);
+    if (!account || !account.smtp_host) return false;
+    // OAuth accounts send via XOAUTH2 — a stored refresh token replaces the
+    // SMTP password.
+    const hasCreds = account.has_smtp_password || (account.auth_type === 'oauth2' && account.has_oauth);
+    return !!((account.smtp_user || account.from_address) && hasCreds);
   }
 
   async function _resolveComposeSendAccountId() {

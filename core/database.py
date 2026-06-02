@@ -316,6 +316,16 @@ class EmailAccount(TimestampMixin, Base):
     smtp_user      = Column(String, default="")
     smtp_password  = Column(String, default="")
 
+    # Authentication. "password" = Basic Auth (imap_password/smtp_password),
+    # the historical default. "oauth2" = XOAUTH2 with a stored refresh token
+    # (Microsoft personal/Exchange accounts, which no longer allow Basic Auth).
+    # The refresh token is Fernet-encrypted at rest, same path as the
+    # passwords; short-lived access tokens are minted on demand and cached
+    # in memory only (see src/oauth_email.py).
+    auth_type           = Column(String, default="password")
+    oauth_provider      = Column(String, default="")   # "microsoft" today
+    oauth_refresh_token = Column(String, default="")   # Fernet-encrypted like *_password
+
     from_address   = Column(String, default="")
 
     __table_args__ = (
@@ -1540,6 +1550,7 @@ def init_db():
     _migrate_seed_email_account()
     _migrate_add_calendar_metadata()
     _migrate_add_calendar_is_utc()
+    _migrate_add_email_oauth_columns()
     _migrate_encrypt_email_passwords()
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
@@ -1659,6 +1670,33 @@ def _migrate_encrypt_email_passwords():
                 logger.info(f"Encrypted plaintext passwords on {migrated} email account row(s)")
     except Exception as e:
         logger.warning(f"Password migration failed (will retry next start): {e}")
+
+
+def _migrate_add_email_oauth_columns():
+    """Add auth_type / oauth_provider / oauth_refresh_token to email_accounts
+    so accounts can authenticate via OAuth2 (XOAUTH2) instead of Basic Auth —
+    required for personal Microsoft + Exchange Online mailboxes (issue #725).
+    Idempotent; safe on every startup."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(email_accounts)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if columns:
+            if "auth_type" not in columns:
+                conn.execute("ALTER TABLE email_accounts ADD COLUMN auth_type TEXT DEFAULT 'password'")
+            if "oauth_provider" not in columns:
+                conn.execute("ALTER TABLE email_accounts ADD COLUMN oauth_provider TEXT DEFAULT ''")
+            if "oauth_refresh_token" not in columns:
+                conn.execute("ALTER TABLE email_accounts ADD COLUMN oauth_refresh_token TEXT DEFAULT ''")
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: added OAuth columns to email_accounts")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"email_accounts OAuth column migration skipped: {e}")
 
 
 def _migrate_add_calendar_is_utc():

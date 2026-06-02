@@ -48,26 +48,79 @@ def _smtp_security_mode(cfg: dict) -> str:
     return "ssl"
 
 
+# ── Authentication (Basic Auth + OAuth2 / XOAUTH2) ──
+
+def _persist_refresh_token(account_id: str | None, new_rt: str) -> None:
+    """Write a rotated OAuth refresh token back to the account row (encrypted).
+    Best-effort: a failure just means we refresh from the prior token next time."""
+    if not (account_id and new_rt):
+        return
+    try:
+        from core.database import SessionLocal as _SL, EmailAccount as _EA
+        from src.secret_storage import encrypt as _enc
+        db = _SL()
+        try:
+            row = db.get(_EA, account_id)
+            if row is not None:
+                row.oauth_refresh_token = _enc(new_rt)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Could not persist rotated refresh token for {account_id!r}: {e}")
+
+
+def _oauth_access_token(cfg: dict) -> str:
+    """Mint/refresh a Microsoft access token for an OAuth account."""
+    from src.oauth_email import get_access_token, resolve_client_id
+    client_id = resolve_client_id(cfg.get("oauth_client_id", ""))
+    acct_id = cfg.get("account_id") or ""
+    return get_access_token(
+        acct_id, client_id, cfg.get("oauth_refresh_token") or "",
+        on_refresh=lambda rt: _persist_refresh_token(acct_id, rt),
+    )
+
+
+def _imap_auth(conn, cfg: dict) -> None:
+    """Authenticate an open imaplib connection per the account's auth_type."""
+    if (cfg.get("auth_type") or "password") == "oauth2":
+        from src.oauth_email import xoauth2_string
+        token = _oauth_access_token(cfg)
+        user = cfg.get("imap_user") or cfg.get("from_address") or ""
+        conn.authenticate("XOAUTH2", lambda _: xoauth2_string(user, token).encode())
+    else:
+        conn.login(cfg["imap_user"], cfg["imap_password"])
+
+
+def _smtp_auth(smtp, cfg: dict) -> None:
+    """Authenticate an open smtplib connection per the account's auth_type.
+    No-op for password accounts that didn't configure SMTP credentials."""
+    if (cfg.get("auth_type") or "password") == "oauth2":
+        from src.oauth_email import xoauth2_string
+        token = _oauth_access_token(cfg)
+        user = cfg.get("smtp_user") or cfg.get("imap_user") or cfg.get("from_address") or ""
+        smtp.ehlo()
+        smtp.auth("XOAUTH2", lambda _=None: xoauth2_string(user, token))
+    elif cfg.get("smtp_user") and cfg.get("smtp_password"):
+        smtp.login(cfg["smtp_user"], cfg["smtp_password"])
+
+
 def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message: str | bytes, timeout: int = 30) -> None:
     """Send through SMTP using the configured transport security mode."""
     host = cfg["smtp_host"]
     port = int(cfg.get("smtp_port") or 465)
-    user = cfg.get("smtp_user") or ""
-    password = cfg.get("smtp_password") or ""
     security = _smtp_security_mode(cfg)
 
     if security == "ssl":
         with smtplib.SMTP_SSL(host, port, timeout=timeout) as smtp:
-            if user and password:
-                smtp.login(user, password)
+            _smtp_auth(smtp, cfg)
             smtp.sendmail(from_addr, recipients, message)
         return
 
     with smtplib.SMTP(host, port, timeout=timeout) as smtp:
         if security == "starttls":
             smtp.starttls()
-        if user and password:
-            smtp.login(user, password)
+        _smtp_auth(smtp, cfg)
         smtp.sendmail(from_addr, recipients, message)
 
 
@@ -547,11 +600,21 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
                     "imap_password": _decrypt(row.imap_password or ""),
                     "imap_starttls": bool(row.imap_starttls),
                     "from_address": row.from_address or row.imap_user or "",
+                    "auth_type": getattr(row, "auth_type", None) or "password",
+                    "oauth_provider": getattr(row, "oauth_provider", None) or "",
+                    "oauth_refresh_token": _decrypt(getattr(row, "oauth_refresh_token", None) or ""),
                 }
-                if not (cfg["smtp_host"] and cfg["smtp_user"] and cfg["smtp_password"]):
-                    logger.warning(f"SMTP not configured for account {row.name!r}")
-                if not (cfg["imap_host"] and cfg["imap_user"] and cfg["imap_password"]):
-                    logger.warning(f"IMAP not configured for account {row.name!r}")
+                _is_oauth = cfg["auth_type"] == "oauth2"
+                # OAuth accounts have no SMTP/IMAP password; validate the refresh
+                # token instead so we don't log spurious "not configured" warnings.
+                if _is_oauth:
+                    if not cfg["oauth_refresh_token"]:
+                        logger.warning(f"OAuth account {row.name!r} has no refresh token — needs sign-in")
+                else:
+                    if not (cfg["smtp_host"] and cfg["smtp_user"] and cfg["smtp_password"]):
+                        logger.warning(f"SMTP not configured for account {row.name!r}")
+                    if not (cfg["imap_host"] and cfg["imap_user"] and cfg["imap_password"]):
+                        logger.warning(f"IMAP not configured for account {row.name!r}")
                 return cfg
         finally:
             db.close()
@@ -577,6 +640,11 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
         "imap_password": settings.get("imap_password", os.environ.get("IMAP_PASSWORD", "")),
         "imap_starttls": settings.get("imap_starttls", True),
         "from_address": settings.get("email_from", os.environ.get("EMAIL_FROM", "")),
+        # OAuth is account-scoped (DB-only); the env/settings fallback path is
+        # always Basic Auth.
+        "auth_type": "password",
+        "oauth_provider": "",
+        "oauth_refresh_token": "",
     }
     if not (cfg["smtp_host"] and cfg["smtp_user"] and cfg["smtp_password"]):
         logger.warning("SMTP not configured — add an Email Account in Settings or set env vars")
@@ -653,7 +721,7 @@ def _imap_connect(account_id: str | None = None, owner: str = ""):
         starttls=bool(cfg.get("imap_starttls")),
         timeout=_IMAP_TIMEOUT_SECONDS,
     )
-    conn.login(cfg["imap_user"], cfg["imap_password"])
+    _imap_auth(conn, cfg)
     return conn
 
 
