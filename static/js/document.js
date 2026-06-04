@@ -2682,9 +2682,10 @@ import * as Modals from './modalManager.js';
     const files = Array.from(e.target.files || []);
     e.target.value = ''; // reset for next upload
     // Email compose docs collect attachments as chips (sent with the message).
-    // Every other doc type is a text editor — drop the file inline as markdown
-    // so the paperclip actually inserts something (issue #2271: attaching an
-    // image to a document silently did nothing for non-email docs).
+    // Every other doc type is a text editor — drop the file inline as a link
+    // (image markdown only for images in a markdown doc, where it renders) so
+    // the paperclip actually inserts something (issue #2271: attaching an image
+    // to a document silently did nothing for non-email docs).
     const doc = docs.get(activeDocId);
     if (doc && doc.language === 'email') {
       await _uploadComposeFiles(files);
@@ -2701,6 +2702,17 @@ import * as Modals from './modalManager.js';
     if (list.length === 0) return;
     const ta = document.getElementById('doc-editor-textarea');
     if (!ta) return;
+    // Only markdown docs render the inserted reference. CSV/SVG are structured
+    // source (table / XML) — injecting a markdown line corrupts them, so skip
+    // the inline embed there. Image markdown is reserved for markdown docs;
+    // every other text/code doc gets a plain link, inert but a valid reference.
+    const doc = docs.get(activeDocId);
+    const lang = ((doc && doc.language) || 'markdown').toLowerCase();
+    if (lang === 'csv' || lang === 'svg') {
+      if (uiModule && uiModule.showToast) uiModule.showToast(`Can't embed attachments in a ${lang.toUpperCase()} document`);
+      return;
+    }
+    const isMarkdownDoc = lang === 'markdown';
     const snippets = [];
     for (const file of list) {
       try {
@@ -2714,7 +2726,9 @@ import * as Modals from './modalManager.js';
         // Strip []() from the label so a stray bracket in the filename can't
         // break the markdown.
         const label = (meta.name || file.name || 'file').replace(/[\[\]()]/g, '');
-        const isImage = (meta.mime || file.type || '').startsWith('image/');
+        // Image markdown only renders in markdown preview; elsewhere a plain
+        // link avoids emitting a broken `![]` that never resolves.
+        const isImage = isMarkdownDoc && (meta.mime || file.type || '').startsWith('image/');
         snippets.push(isImage ? `![${label}](${url})` : `[${label}](${url})`);
       } catch (err) {
         if (uiModule && uiModule.showError) uiModule.showError(`Failed to attach ${file.name}: ${err.message || err}`);
